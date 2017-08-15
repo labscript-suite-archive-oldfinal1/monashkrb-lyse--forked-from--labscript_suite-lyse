@@ -12,6 +12,8 @@ import signal
 import subprocess
 import time
 
+import pprint
+import ast
 
 # Turn on our error catching for all subsequent imports
 import labscript_utils.excepthook
@@ -190,8 +192,20 @@ class WebServer(ZMQServer):
 
 
 class LyseMainWindow(QtGui.QMainWindow):
+    # A signal to show that the window is shown and painted.
+    firstPaint = Signal()
     # A signal for when the window manager has created a new window for this widget:
     newWindow = Signal(int)
+
+    def __init__(self, *args, **kwargs):
+        QtGui.QMainWindow.__init__(self, *args, **kwargs)
+        self._previously_painted = False
+
+    def closeEvent(self, event):
+        if app.on_close_event():
+            return QtGui.QMainWindow.closeEvent(self, event)
+        else:
+            event.ignore()
 
     def event(self, event):
         result = QtGui.QMainWindow.event(self, event)
@@ -199,10 +213,17 @@ class LyseMainWindow(QtGui.QMainWindow):
             self.newWindow.emit(self.effectiveWinId())
         return result
 
-        
+    def paintEvent(self, event):
+        result = QtGui.QMainWindow.paintEvent(self, event)
+        if not self._previously_painted:
+            self._previously_painted = True
+            self.firstPaint.emit()
+        return result
+
+
 class AnalysisRoutine(object):
 
-    def __init__(self, filepath, model, output_box_port):
+    def __init__(self, filepath, model, output_box_port, checked=QtCore.Qt.Checked):
         self.filepath = filepath
         self.shortname = os.path.basename(self.filepath)
         self.model = model
@@ -221,7 +242,7 @@ class AnalysisRoutine(object):
         # Make a row to put into the model:
         active_item =  QtGui.QStandardItem()
         active_item.setCheckable(True)
-        active_item.setCheckState(QtCore.Qt.Checked)
+        active_item.setCheckState(checked)
         info_item = QtGui.QStandardItem()
         name_item = QtGui.QStandardItem(self.shortname)
         name_item.setToolTip(self.filepath)
@@ -503,12 +524,24 @@ class RoutineBox(object):
 
         # Save the containing folder for use next time we open the dialog box:
         self.last_opened_routine_folder = os.path.dirname(routine_files[0])
+        self.add_routines([(routine_file, QtCore.Qt.Checked) for routine_file in routine_files])
+
+    def add_routines(self, routine_files, clear_existing=False):
+        """Add routines to the routine box, where routine_files is a list of
+        tuples containing the filepath and whether the routine is enabled or
+        not when it is added. if clear_existing == True, then any existing
+        analysis routines will be cleared before the new ones are added."""
+        if clear_existing:
+            for routine in self.routines[:]:
+                routine.remove()
+                self.routines.remove(routine)
+
         # Queue the files to be opened:
-        for filepath in routine_files:
+        for filepath, checked in routine_files:
             if filepath in [routine.filepath for routine in self.routines]:
                 app.output_box.output('Warning: Ignoring duplicate analysis routine %s\n'%filepath, red=True)
                 continue
-            routine = AnalysisRoutine(filepath, self.model, self.output_box_port)
+            routine = AnalysisRoutine(filepath, self.model, self.output_box_port, checked)
             self.routines.append(routine)
         self.update_select_all_checkstate()
         
@@ -1717,12 +1750,12 @@ class FileBox(object):
         self.to_singleshot.put(filepath)
         while True:
             signal, status_percent, updated_data = self.from_singleshot.get()
-            if signal in ['error', 'progress']:
-                for file in updated_data:
-                    self.shots_model.update_row(file, status_percent=status_percent, updated_row_data=updated_data[file])
+            for file in updated_data:
+                # Update the data for all the rows with new data:
+                self.shots_model.update_row(file, updated_row_data=updated_data[file])
+            # Update the status percent for the the row on which analysis is actually running:
+            self.shots_model.update_row(filepath, status_percent=status_percent, dataframe_already_updated=True)
             if signal == 'done':
-                # No need to update the dataframe again, that should have been done with the last 'progress' signal:
-                self.shots_model.update_row(filepath, status_percent=status_percent, dataframe_already_updated=True)
                 return
             if signal == 'error':
                 if not os.path.exists(filepath):
@@ -1732,6 +1765,9 @@ class FileBox(object):
                 else:
                     self.pause_analysis()
                 return
+            if signal == 'progress':
+                continue
+            raise ValueError('invalid signal %s' % str(signal))
                         
     def do_multishot_analysis(self):
         self.to_multishot.put(None)
@@ -1775,16 +1811,233 @@ class Lyse(object):
         self.filebox = FileBox(self.ui.verticalLayout_filebox, self.exp_config,
                                to_singleshot, from_singleshot, to_multishot, from_multishot)
 
+        self.last_save_config_file = None
+        self.last_save_data = None
+
+        self.ui.actionLoad_configuration.triggered.connect(self.on_load_configuration_triggered)
+        self.ui.actionRevert_configuration.triggered.connect(self.on_revert_configuration_triggered)
+        self.ui.actionSave_configuration.triggered.connect(self.on_save_configuration_triggered)
+        self.ui.actionSave_configuration_as.triggered.connect(self.on_save_configuration_as_triggered)
+
         self.ui.resize(1600, 900)
 
         # Set the splitters to appropriate fractions of their maximum size:
         self.ui.splitter_horizontal.setSizes([1000, 600])
         self.ui.splitter_vertical.setSizes([300, 600])
+
+        # autoload a config file, if labconfig is set to do so:
+        try:
+            autoload_config_file = self.exp_config.get('lyse', 'autoload_config_file')
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            self.output_box.output('Ready.\n\n')
+        else:
+            self.ui.setEnabled(False)
+            self.output_box.output('Loading default config file %s...' % autoload_config_file)
+
+            def load_the_config_file():
+                try:
+                    self.load_configuration(autoload_config_file)
+                    self.output_box.output('done.\n')
+                except Exception as e:
+                    self.output_box.output('\nCould not load config file: %s: %s\n\n' %
+                                           (e.__class__.__name__, str(e)), red=True)
+                else:
+                    self.output_box.output('Ready.\n\n')
+                finally:
+                    self.ui.setEnabled(True)
+            # Defer this until 50ms after the window has shown,
+            # so that the GUI pops up faster in the meantime
+            self.ui.firstPaint.connect(lambda: QtCore.QTimer.singleShot(50, load_the_config_file))
+
         self.ui.show()
         # self.ui.showMaximized()
 
+    def on_close_event(self):
+        save_data = self.get_save_data()
+        if self.last_save_data is not None and save_data != self.last_save_data:
+            if self.only_window_geometry_is_different(save_data, self.last_save_data):
+                self.save_configuration(self.last_save_config_file)
+                return True
+
+            message = ('Current configuration (which scripts are loaded and other GUI state) '
+                       'has changed: save config file \'%s\'?' % self.last_save_config_file)
+            reply = QtGui.QMessageBox.question(self.ui, 'Quit lyse', message,
+                                               QtGui.QMessageBox.Yes | QtGui.QMessageBox.No | QtGui.QMessageBox.Cancel)
+            if reply == QtGui.QMessageBox.Cancel:
+                return False
+            if reply == QtGui.QMessageBox.Yes:
+                self.save_configuration(self.last_save_config_file)
+        return True
+
+    def on_save_configuration_triggered(self):
+        if self.last_save_config_file is None:
+            self.on_save_configuration_as_triggered()
+            self.ui.actionSave_configuration_as.setEnabled(True)
+            self.ui.actionRevert_configuration.setEnabled(True)
+        else:
+            self.save_configuration(self.last_save_config_file)
+
+    def on_revert_configuration_triggered(self):
+        save_data = self.get_save_data()
+        if self.last_save_data is not None and save_data != self.last_save_data:
+            message = 'Revert configuration to the last saved state in \'%s\'?' % self.last_save_config_file
+            reply = QtGui.QMessageBox.question(self.ui, 'Load configuration', message,
+                                               QtGui.QMessageBox.Yes | QtGui.QMessageBox.Cancel)
+            if reply == QtGui.QMessageBox.Cancel:
+                return
+            elif reply == QtGui.QMessageBox.Yes:
+                self.load_configuration(self.last_save_config_file)
+        else:
+            error_dialog('no changes to revert')
+
+    def on_save_configuration_as_triggered(self):
+        if self.last_save_config_file is not None:
+            default = self.last_save_config_file
+        else:
+            try:
+                default_path = os.path.join(self.exp_config.get('DEFAULT', 'app_saved_configs'), 'lyse')
+            except LabConfig.NoOptionError:
+                self.exp_config.set('DEFAULT', 'app_saved_configs', os.path.join('%(labscript_suite)s', 'userlib', 'app_saved_configs', '%(experiment_name)s'))
+                default_path = os.path.join(self.exp_config.get('DEFAULT', 'app_saved_configs'), 'lyse')
+                if not os.path.exists(default_path):
+                    os.makedirs(default_path)
+
+            default = os.path.join(default_path, 'lyse.ini')
+        save_file = QtGui.QFileDialog.getSaveFileName(self.ui,
+                                                      'Select  file to save current lyse configuration',
+                                                      default,
+                                                      "config files (*.ini)")
+        if not save_file:
+            # User cancelled
+            return
+        # Convert to standard platform specific path, otherwise Qt likes
+        # forward slashes:
+        save_file = os.path.abspath(save_file)
+        self.save_configuration(save_file)
+
+    def only_window_geometry_is_different(self, current_data, old_data):
+        ui_keys = ['window_size', 'window_pos', 'splitter', 'splitter_vertical', 'splitter_horizontal']
+        compare = [current_data[key] == old_data[key] for key in current_data.keys() if key not in ui_keys]
+        return all(compare)
+
+    def get_save_data(self):
+        save_data = {}
+
+        box = self.singleshot_routinebox
+        save_data['SingleShot'] = zip([routine.filepath for routine in box.routines], [box.model.item(row, box.COL_ACTIVE).checkState()  for row in range(box.model.rowCount())])
+        save_data['LastSingleShotFolder'] = box.last_opened_routine_folder
+        box = self.multishot_routinebox
+        save_data['MultiShot'] = zip([routine.filepath for routine in box.routines], [box.model.item(row, box.COL_ACTIVE).checkState()  for row in range(box.model.rowCount())])
+        save_data['LastMultiShotFolder'] = box.last_opened_routine_folder
+
+        save_data['LastFileBoxFolder'] = self.filebox.last_opened_shots_folder
+
+        save_data['analysis_paused'] = self.filebox.analysis_paused
+        window_size = self.ui.size()
+        save_data['window_size'] = (window_size.width(), window_size.height())
+        window_pos = self.ui.pos()
+        save_data['window_pos'] = (window_pos.x(), window_pos.y())
+
+        save_data['splitter'] = self.ui.splitter.sizes()
+        save_data['splitter_vertical'] = self.ui.splitter_vertical.sizes()
+        save_data['splitter_horizontal'] = self.ui.splitter_horizontal.sizes()
+        return save_data
+
+    def save_configuration(self, save_file):
+        lyse_config = LabConfig(save_file)
+        save_data = self.get_save_data()
+        self.last_save_config_file = save_file
+        self.last_save_data = save_data
+        for key, value in save_data.items():
+            lyse_config.set('lyse_state', key, pprint.pformat(value))
+
+    def on_load_configuration_triggered(self):
+        save_data = self.get_save_data()
+        if self.last_save_data is not None and save_data != self.last_save_data:
+            message = ('Current configuration (which groups are active/open and other GUI state) '
+                       'has changed: save config file \'%s\'?' % self.last_save_config_file)
+            reply = QtGui.QMessageBox.question(self.ui, 'Load configuration', message,
+                                               QtGui.QMessageBox.Yes | QtGui.QMessageBox.No | QtGui.QMessageBox.Cancel)
+            if reply == QtGui.QMessageBox.Cancel:
+                return
+            if reply == QtGui.QMessageBox.Yes:
+                self.save_configuration(self.last_save_config_file)
+
+        if self.last_save_config_file is not None:
+            default = self.last_save_config_file
+        else:
+            default = os.path.join(self.exp_config.get('paths', 'experiment_shot_storage'), 'lyse.ini')
+
+        file = QtGui.QFileDialog.getOpenFileName(self.ui,
+                                                 'Select lyse configuration file to load',
+                                                 default,
+                                                 "config files (*.ini)")
+        if not file:
+            # User cancelled
+            return
+        # Convert to standard platform specific path, otherwise Qt likes
+        # forward slashes:
+        file = os.path.abspath(file)
+        self.load_configuration(file)
+
+    def load_configuration(self, filename):
+        self.last_save_config_file = filename
+        self.ui.actionSave_configuration.setText('Save configuration %s' % filename)
+        lyse_config = LabConfig(filename)
+
+        try:
+            self.singleshot_routinebox.add_routines(ast.literal_eval(lyse_config.get('lyse_state', 'SingleShot')), clear_existing=True)
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.singleshot_routinebox.last_opened_routine_folder = ast.literal_eval(lyse_config.get('lyse_state', 'LastSingleShotFolder'))
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.multishot_routinebox.add_routines(ast.literal_eval(lyse_config.get('lyse_state', 'MultiShot')), clear_existing=True)
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.multishot_routinebox.last_opened_routine_folder = ast.literal_eval(lyse_config.get('lyse_state', 'LastMultiShotFolder'))
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.filebox.last_opened_shots_folder = ast.literal_eval(lyse_config.get('lyse_state', 'LastFileBoxFolder'))
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.ui.resize(*ast.literal_eval(lyse_config.get('lyse_state', 'window_size')))
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.ui.move(*ast.literal_eval(lyse_config.get('lyse_state', 'window_pos')))
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            if ast.literal_eval(lyse_config.get('lyse_state', 'analysis_paused')):
+                self.filebox.pause_analysis()
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.ui.splitter.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter')))
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.ui.splitter_vertical.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter_vertical')))
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+        try:
+            self.ui.splitter_horizontal.setSizes(ast.literal_eval(lyse_config.get('lyse_state', 'splitter_horizontal')))
+        except (LabConfig.NoOptionError, LabConfig.NoSectionError):
+            pass
+
+        # Set as self.last_save_data:
+        save_data = self.get_save_data()
+        self.last_save_data = save_data
+        self.ui.actionSave_configuration_as.setEnabled(True)
+        self.ui.actionRevert_configuration.setEnabled(True)
+
     def setup_config(self):
-        config_path = os.path.join(config_prefix, '%s.ini' % socket.gethostname())
         required_config_params = {"DEFAULT": ["experiment_name"],
                                   "programs": ["text_editor",
                                                "text_editor_arguments",
@@ -1795,7 +2048,7 @@ class Lyse(object):
                                             "analysislib"],
                                   "ports": ["lyse"]
                                   }
-        self.exp_config = LabConfig(config_path, required_config_params)
+        self.exp_config = LabConfig(required_params=required_config_params)
 
     def connect_signals(self):
         if os.name == 'nt':
